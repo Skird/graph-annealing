@@ -2,8 +2,10 @@
 #include <iostream>
 #include <fstream>
 #include <random>
+#include <string>
 #include <algorithm>
 
+#include <boost/algorithm/string.hpp>
 #include <boost/program_options/options_description.hpp>
 #include <boost/program_options/variables_map.hpp>
 #include <boost/program_options/parsers.hpp>
@@ -14,6 +16,25 @@ typedef float float_t;
 
 struct Point {
 	float_t x, y;
+
+	Point() {}
+	Point(float_t nx, float_t ny): x(nx), y(ny) {}
+
+	Point operator - (const Point &p) const {
+		return Point(x - p.x, y - p.y);
+	}
+
+	Point operator + (const Point &p) const {
+		return Point(x + p.x, y + p.y);
+	}
+
+	float_t operator * (const Point &p) const {
+		return x * p.x + y * p.y;
+	}
+
+	Point operator * (const float_t k) const {
+		return Point(x * k, y * k);
+	}
 };
 
 struct GraphLayout {
@@ -24,7 +45,8 @@ struct GraphLayout {
 
 	GraphLayout(
 			int n,
-			float_t nodeDistW, float_t borderW, float_t edgeW, float_t crossW,
+			float_t nodeDistW, float_t borderW, float_t edgeW,
+			float_t crossW, float_t crossT,
 			float_t canvasW, float_t canvasH
 	) {
 		this->n = n;
@@ -32,6 +54,7 @@ struct GraphLayout {
 		_bw = borderW;
 		_ew = edgeW;
 		_cw = crossW;
+		_mind = crossT;
 		W = canvasW;
 		H = canvasH;
 		adj.assign(n, std::vector<int>());
@@ -63,8 +86,12 @@ struct GraphLayout {
 		_tmpce = _ce;
 		_tmpPoint = layout[v];
 		addEnergy(v, -1);
-		layout[v].x = std::clamp<float_t>(layout[v].x + d.x, W / 1000, W * 0.999);
-		layout[v].y = std::clamp<float_t>(layout[v].y + d.y, H / 1000, H * 0.999);
+		layout[v].x = std::clamp<float_t>(
+				layout[v].x + d.x, W / 1000, static_cast<const float_t &>(W * 0.999)
+		);
+		layout[v].y = std::clamp<float_t>(
+				layout[v].y + d.y, H / 1000, static_cast<const float_t &>(H * 0.999)
+		);
 		addEnergy(v, 1);
 	}
 
@@ -98,6 +125,7 @@ struct GraphLayout {
 	};
 
 private:
+	float_t _mind;
 	float_t _ne, _be, _ee, _ce;
 	float_t _tmpne, _tmpbe, _tmpee, _tmpce;
 	Point _tmpPoint;
@@ -109,6 +137,18 @@ private:
 
 	float_t _sqdist(int i, int j) {
 		return _sqr(layout[i].x - layout[j].x) + _sqr(layout[i].y - layout[j].y);
+	}
+
+	float_t _segsqdist(int u, int v, int w) {
+		float_t ans = fmin(_sqdist(w, u), _sqdist(w, v));
+		Point uw = layout[w] - layout[u];
+		Point uv = layout[v] - layout[u];
+		float_t cp = uw * uv;
+		if (cp < 0) return ans;
+		if ((layout[u] - layout[v]) * (layout[w] - layout[v]) < 0) return ans;
+		cp /= uv * uv;
+		Point h = layout[u] + (uv * cp);
+		return _sqr(layout[w].x - h.x) + _sqr(layout[w].y - h.y);
 	}
 
 	void initEnergy() {
@@ -138,13 +178,22 @@ private:
 					if (v < u) {
 						dE += _sqdist(v, u);
 					}
-
 				}
 			}
 			_ee += _ew * dE;
 		}
 		if (_cw != 0) {
-			// TODO: implement this
+			float_t dE = 0;
+			for (int v = 0; v < n; ++v) {
+				for (int u : adj[v]) {
+					if (u < v) continue;
+					for (int w = 0; w < n; ++w) {
+						if (v == w || u == w) continue;
+						dE += 1 / fmax(_mind, _segsqdist(u, v, w));
+					}
+				}
+			}
+			_ce += _cw * dE;
 		}
 	}
 
@@ -170,7 +219,23 @@ private:
 			_ee += c * _ew * dE;
 		}
 		if (_cw != 0) {
-			// TODO: implement this
+			float_t dE = 0;
+			for (int u = 0; u < n; ++u) {
+				for (int w : adj[u]) {
+					if (u == v || w == v || w < u) continue;
+					dE += 1 / fmax(_mind, _segsqdist(u, w, v));
+				}
+			}
+			for (int u : adj[v]) {
+				for (int w = 0; w < n; ++w) {
+					if (v == w || u == w) continue;
+					dE += 1 / fmax(_mind, _segsqdist(v, u, w));
+//					std::cerr << "DEBUG " << _segsqdist(v, u, w) << "\n";
+//					std::cerr << "DEBUG " << _segsqdist(u, v, w) << "\n";
+//					std::cerr << "====\n";
+				}
+			}
+			_ce += c * _cw * dE;
 		}
 	}
 };
@@ -190,18 +255,26 @@ void print_layout(const GraphLayout &layout) {
 }
 
 template<typename RNG>
-void simulate_annealing(GraphLayout &layout, int iters, float_t startT, float_t dT, RNG &rng, bool verbose) {
+void simulate_annealing(
+		GraphLayout &layout, int iters, float_t startT,
+		float_t dT, bool fine_tune, RNG &rng, bool verbose
+) {
 	std::uniform_int_distribution<int> vdis(0, layout.n - 1);
 	std::uniform_real_distribution<float_t> pdis(0, 1);
 
-	float_t curS = hypotl(layout.W, layout.H) / 2;
-	float_t dS = powl(0.001, (float_t) 1.0 / iters);
+	auto curS = static_cast<float_t>(hypotl(layout.W, layout.H) / 2);
+	auto dS = static_cast<float_t>(powl(0.001, (float_t) 1.0 / iters));
 	float_t temp = startT;
+
+	if (fine_tune) {
+		curS = static_cast<float_t>(hypotl(layout.W, layout.H) / 300);
+		dS = 1.0;
+	}
 
 	print_layout(layout);
 	for (int i = 0; i < iters; ++i) {
 		int v = vdis(rng);
-		Point d;
+		Point d{};
 		d.x = (2 * std::generate_canonical<float_t, 1, RNG>(rng) - 1) * curS;
 		d.y = (2 * std::generate_canonical<float_t, 1, RNG>(rng) - 1) * curS;
 		float_t was_energy = layout.getEnergy();
@@ -214,8 +287,11 @@ void simulate_annealing(GraphLayout &layout, int iters, float_t startT, float_t 
 		}
 		layout.move(v, d);
 		float_t new_energy = layout.getEnergy();
-		if (new_energy > was_energy && pdis(rng) >
-			transition_probability(new_energy - was_energy, temp)
+		if (
+				(fine_tune && new_energy > was_energy) ||
+				(new_energy > was_energy &&
+					pdis(rng) > transition_probability(new_energy - was_energy, temp)
+				)
 		) {
 			layout.undoMove(v, d);
 			if (verbose) {
@@ -240,6 +316,7 @@ int main(int argc, char **argv) {
 		("edges", po::value<float_t>(), "weight of length of edges in energy")
 		("border", po::value<float_t>(), "weight of proximity to borderline in energy")
 		("cross", po::value<float_t>(), "weight of crossings in energy")
+		("cross-threshold", po::value<float_t>(), "minimum distance value for node edge interaction")
 		("startT", po::value<float_t>(), "statring temperature")
 		("cooling", po::value<float_t>(), "schedule of temperature reduction")
 		("rounds", po::value<int>(), "number of rounds of annealing")
@@ -278,6 +355,7 @@ int main(int argc, char **argv) {
 			varmap["border"].as<float_t>(),
 			varmap["edges"].as<float_t>(),
 			(varmap.count("cross") ? varmap["cross"].as<float_t>() : 0),
+			(varmap.count("cross-threshold") ? varmap["cross-threshold"].as<float_t>() : 1),
 			varmap["width"].as<float_t>(),
 			varmap["height"].as<float_t>()
 	);
@@ -290,9 +368,15 @@ int main(int argc, char **argv) {
 	std::vector<Point> start;
 	if (varmap.count("starting-layout")) {
 		std::ifstream start_file(varmap["starting-layout"].as<std::string>());
-		start.resize(n);
+		std::string s, last;
+		while (std::getline(start_file, s)) {
+			last = s;
+		}
+		std::istringstream ss(last);
+		start.resize(static_cast<unsigned long>(n));
 		for (int i = 0; i < n; ++i) {
-			start_file >> start[i].x >> start[i].y;
+			char sep;
+			ss >> start[i].x >> start[i].y >> sep;
 		}
 	}
 	std::mt19937 rng(varmap.count("seed") ? varmap["seed"].as<int>() : 0);
@@ -301,6 +385,7 @@ int main(int argc, char **argv) {
 	simulate_annealing(
 			layout, varmap["rounds"].as<int>(),
 			varmap["startT"].as<float_t>(), varmap["cooling"].as<float_t>(),
-			rng, varmap.count("verbose")
+			static_cast<bool>(varmap.count("fine-tune")), rng,
+			static_cast<bool>(varmap.count("verbose"))
 	);
 }
